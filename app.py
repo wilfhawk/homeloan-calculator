@@ -2,44 +2,167 @@
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import io
+from datetime import datetime
 
 # Page configuration
 st.set_page_config(
-    page_title="Home Loan vs Rental Calculator",
+    page_title="Home Loan vs Rental Calculator Pro",
     page_icon="🏠",
     layout="wide"
 )
 
+# ==================== HELPER FUNCTIONS ====================
+
+def calculate_monthly_mortgage(loan_amount, annual_rate, years):
+    """Calculate monthly mortgage payment (P&I only)"""
+    monthly_rate = annual_rate / 100 / 12
+    num_payments = years * 12
+    
+    if monthly_rate > 0:
+        payment = loan_amount * (
+            monthly_rate * (1 + monthly_rate)**num_payments
+        ) / ((1 + monthly_rate)**num_payments - 1)
+    else:
+        payment = loan_amount / num_payments
+    
+    return payment
+
+def generate_amortization_schedule(loan_amount, annual_rate, years, start_year=1):
+    """Generate complete amortization schedule"""
+    monthly_rate = annual_rate / 100 / 12
+    num_payments = years * 12
+    monthly_payment = calculate_monthly_mortgage(loan_amount, annual_rate, years)
+    
+    schedule = []
+    balance = loan_amount
+    
+    for month in range(1, num_payments + 1):
+        interest_payment = balance * monthly_rate
+        principal_payment = monthly_payment - interest_payment
+        balance -= principal_payment
+        
+        schedule.append({
+            'Month': month,
+            'Year': start_year + (month - 1) // 12,
+            'Payment': monthly_payment,
+            'Principal': principal_payment,
+            'Interest': interest_payment,
+            'Balance': max(0, balance)
+        })
+    
+    return pd.DataFrame(schedule)
+
+def calculate_tax_savings(mortgage_interest, property_tax, income, filing_status):
+    """Calculate annual tax savings from mortgage interest and property tax deductions"""
+    # 2024 standard deductions
+    standard_deductions = {
+        'Single': 14600,
+        'Married Filing Jointly': 29200,
+        'Head of Household': 21900
+    }
+    
+    # Simplified tax brackets (2024)
+    tax_brackets = {
+        'Single': [(11600, 0.10), (47150, 0.12), (100525, 0.22), (191950, 0.24), (243725, 0.32), (609350, 0.35), (float('inf'), 0.37)],
+        'Married Filing Jointly': [(23200, 0.10), (94300, 0.12), (201050, 0.22), (383900, 0.24), (487450, 0.32), (731200, 0.35), (float('inf'), 0.37)],
+        'Head of Household': [(16550, 0.10), (63100, 0.12), (100500, 0.22), (191950, 0.24), (243700, 0.32), (609350, 0.35), (float('inf'), 0.37)]
+    }
+    
+    standard_deduction = standard_deductions[filing_status]
+    itemized_deduction = mortgage_interest + property_tax
+    
+    # Only benefit if itemizing exceeds standard deduction
+    if itemized_deduction <= standard_deduction:
+        return 0
+    
+    # Calculate tax on the difference
+    extra_deduction = itemized_deduction - standard_deduction
+    
+    # Simplified calculation: use marginal rate
+    brackets = tax_brackets[filing_status]
+    for limit, rate in brackets:
+        if income <= limit:
+            tax_savings = extra_deduction * rate
+            return tax_savings
+    
+    return 0
+
+def calculate_break_even_point(ownership_costs_yearly, rental_costs_yearly, home_equity_yearly):
+    """Find the year when buying becomes cheaper than renting (net cost basis)"""
+    cumulative_own = 0
+    cumulative_rent = 0
+    
+    for year in range(len(ownership_costs_yearly)):
+        cumulative_own += ownership_costs_yearly[year]
+        cumulative_rent += rental_costs_yearly[year]
+        
+        # Net cost of ownership (costs - equity)
+        net_ownership = cumulative_own - home_equity_yearly[year]
+        
+        if net_ownership < cumulative_rent:
+            return year + 1
+    
+    return None  # Never breaks even in the analysis period
+
+def calculate_closing_costs(home_price, loan_amount):
+    """Estimate closing costs"""
+    # Typical closing cost percentages
+    origination_fee = loan_amount * 0.01  # 1% origination
+    appraisal = 500
+    title_insurance = home_price * 0.005  # 0.5% of home price
+    inspection = 500
+    recording_fees = 200
+    other_fees = 1000
+    
+    total = origination_fee + appraisal + title_insurance + inspection + recording_fees + other_fees
+    
+    return {
+        'origination_fee': origination_fee,
+        'appraisal': appraisal,
+        'title_insurance': title_insurance,
+        'inspection': inspection,
+        'recording_fees': recording_fees,
+        'other_fees': other_fees,
+        'total': total
+    }
+
+# ==================== MAIN APP ====================
+
 # Title and introduction
-st.title("🏠 Home Loan vs Rental Cost Comparison")
+st.title("🏠 Home Loan vs Rental Calculator Pro")
 st.markdown("""
-Compare the true cost of buying a home versus renting over time. 
-This calculator considers mortgage payments, opportunity costs, maintenance, and more.
+Advanced financial calculator to compare buying vs renting with tax benefits, 
+amortization schedules, closing costs, and scenario comparisons.
 """)
 
-st.divider()
+# Create tabs for different sections
+tab1, tab2, tab3, tab4 = st.tabs(["📊 Main Analysis", "🔢 Amortization Schedule", "⚖️ Compare Scenarios", "💾 Export Results"])
 
-# Create two columns for inputs
-col1, col2 = st.columns(2)
+# ==================== SIDEBAR: INPUTS ====================
 
-with col1:
-    st.subheader("🏡 Home Purchase Details")
+with st.sidebar:
+    st.header("Input Parameters")
+    
+    # Scenario name (for multi-scenario comparison)
+    scenario_name = st.text_input("Scenario Name", value="Default Scenario", help="Name this scenario for comparison")
+    
+    st.subheader("🏡 Home Purchase")
     
     home_price = st.number_input(
         "Home Price ($)",
         min_value=50000,
         max_value=5000000,
         value=400000,
-        step=10000,
-        help="Total purchase price of the home"
+        step=10000
     )
     
     down_payment_pct = st.slider(
         "Down Payment (%)",
         min_value=0,
         max_value=50,
-        value=20,
-        help="Percentage of home price paid upfront"
+        value=20
     )
     
     interest_rate = st.number_input(
@@ -47,24 +170,24 @@ with col1:
         min_value=0.0,
         max_value=15.0,
         value=6.5,
-        step=0.1,
-        help="Annual mortgage interest rate"
+        step=0.1
     )
     
     loan_term = st.selectbox(
         "Loan Term (years)",
         options=[15, 20, 30],
-        index=2,
-        help="Length of mortgage in years"
+        index=2
     )
+    
+    # Closing costs toggle
+    include_closing = st.checkbox("Include Closing Costs", value=True)
     
     property_tax_annual = st.number_input(
         "Annual Property Tax ($)",
         min_value=0,
         max_value=50000,
         value=5000,
-        step=500,
-        help="Yearly property tax amount"
+        step=500
     )
     
     home_insurance_annual = st.number_input(
@@ -72,8 +195,7 @@ with col1:
         min_value=0,
         max_value=10000,
         value=1200,
-        step=100,
-        help="Yearly home insurance premium"
+        step=100
     )
     
     hoa_monthly = st.number_input(
@@ -81,8 +203,7 @@ with col1:
         min_value=0,
         max_value=2000,
         value=0,
-        step=50,
-        help="Monthly homeowners association fees (if applicable)"
+        step=50
     )
     
     maintenance_pct = st.slider(
@@ -90,20 +211,19 @@ with col1:
         min_value=0.0,
         max_value=3.0,
         value=1.0,
-        step=0.1,
-        help="Typical range is 1-2% of home value per year"
+        step=0.1
     )
-
-with col2:
-    st.subheader("🏢 Rental Details")
+    
+    st.divider()
+    
+    st.subheader("🏢 Rental")
     
     monthly_rent = st.number_input(
         "Monthly Rent ($)",
         min_value=500,
         max_value=20000,
         value=2500,
-        step=100,
-        help="Current monthly rent payment"
+        step=100
     )
     
     rent_increase_annual = st.slider(
@@ -111,8 +231,7 @@ with col2:
         min_value=0.0,
         max_value=10.0,
         value=3.0,
-        step=0.5,
-        help="Average yearly increase in rent"
+        step=0.5
     )
     
     renters_insurance_annual = st.number_input(
@@ -120,9 +239,29 @@ with col2:
         min_value=0,
         max_value=1000,
         value=200,
-        step=50,
-        help="Yearly renter's insurance premium"
+        step=50
     )
+    
+    st.divider()
+    
+    st.subheader("💰 Tax & Financial")
+    
+    annual_income = st.number_input(
+        "Annual Household Income ($)",
+        min_value=0,
+        max_value=1000000,
+        value=100000,
+        step=5000,
+        help="Used for tax benefit calculations"
+    )
+    
+    filing_status = st.selectbox(
+        "Tax Filing Status",
+        options=['Single', 'Married Filing Jointly', 'Head of Household'],
+        index=1
+    )
+    
+    st.divider()
     
     st.subheader("📊 Analysis Parameters")
     
@@ -130,8 +269,7 @@ with col2:
         "Analysis Period (years)",
         min_value=1,
         max_value=30,
-        value=10,
-        help="How many years to compare"
+        value=10
     )
     
     home_appreciation = st.slider(
@@ -139,8 +277,7 @@ with col2:
         min_value=0.0,
         max_value=10.0,
         value=3.0,
-        step=0.5,
-        help="Historical average is around 3-4%"
+        step=0.5
     )
     
     investment_return = st.slider(
@@ -148,186 +285,303 @@ with col2:
         min_value=0.0,
         max_value=15.0,
         value=7.0,
-        step=0.5,
-        help="Return if down payment invested instead (e.g., stock market average ~7-10%)"
-    )
-
-st.divider()
-
-# Calculate button
-if st.button("📊 Calculate Comparison", type="primary", use_container_width=True):
-    
-    # CALCULATIONS
-    # Down payment
-    down_payment = home_price * (down_payment_pct / 100)
-    loan_amount = home_price - down_payment
-    
-    # Monthly mortgage payment (Principal + Interest)
-    monthly_interest_rate = interest_rate / 100 / 12
-    num_payments = loan_term * 12
-    
-    if monthly_interest_rate > 0:
-        monthly_mortgage = loan_amount * (
-            monthly_interest_rate * (1 + monthly_interest_rate)**num_payments
-        ) / ((1 + monthly_interest_rate)**num_payments - 1)
-    else:
-        monthly_mortgage = loan_amount / num_payments
-    
-    # Monthly ownership costs
-    monthly_property_tax = property_tax_annual / 12
-    monthly_insurance = home_insurance_annual / 12
-    monthly_maintenance = (home_price * (maintenance_pct / 100)) / 12
-    
-    total_monthly_ownership = (
-        monthly_mortgage + 
-        monthly_property_tax + 
-        monthly_insurance + 
-        hoa_monthly + 
-        monthly_maintenance
+        step=0.5
     )
     
-    # Monthly rental costs
-    monthly_renters_insurance = renters_insurance_annual / 12
-    total_monthly_rental = monthly_rent + monthly_renters_insurance
+    # Save scenario button
+    if st.button("💾 Save This Scenario", use_container_width=True):
+        if 'scenarios' not in st.session_state:
+            st.session_state.scenarios = []
+        
+        scenario = {
+            'name': scenario_name,
+            'home_price': home_price,
+            'down_payment_pct': down_payment_pct,
+            'interest_rate': interest_rate,
+            'loan_term': loan_term,
+            'property_tax_annual': property_tax_annual,
+            'monthly_rent': monthly_rent,
+            'analysis_years': analysis_years
+        }
+        
+        st.session_state.scenarios.append(scenario)
+        st.success(f"✅ Saved '{scenario_name}'!")
+
+# ==================== CALCULATIONS ====================
+
+# Basic calculations
+down_payment = home_price * (down_payment_pct / 100)
+loan_amount = home_price - down_payment
+
+# Closing costs
+closing_costs = calculate_closing_costs(home_price, loan_amount) if include_closing else None
+
+# Monthly mortgage payment
+monthly_mortgage = calculate_monthly_mortgage(loan_amount, interest_rate, loan_term)
+
+# Generate amortization schedule
+amortization = generate_amortization_schedule(loan_amount, interest_rate, loan_term)
+
+# Monthly costs
+monthly_property_tax = property_tax_annual / 12
+monthly_insurance = home_insurance_annual / 12
+monthly_maintenance = (home_price * (maintenance_pct / 100)) / 12
+
+total_monthly_ownership = (
+    monthly_mortgage + 
+    monthly_property_tax + 
+    monthly_insurance + 
+    hoa_monthly + 
+    monthly_maintenance
+)
+
+monthly_renters_insurance = renters_insurance_annual / 12
+total_monthly_rental = monthly_rent + monthly_renters_insurance
+
+# Multi-year analysis with tax benefits
+years_list = []
+ownership_cumulative = []
+rental_cumulative = []
+home_equity = []
+tax_savings_cumulative = []
+ownership_costs_yearly = []
+rental_costs_yearly = []
+home_equity_yearly = []
+
+current_home_value = home_price
+current_rent = monthly_rent
+cumulative_own = down_payment
+if include_closing and closing_costs:
+    cumulative_own += closing_costs['total']
+cumulative_rent = 0
+remaining_principal = loan_amount
+cumulative_tax_savings = 0
+
+for year in range(1, analysis_years + 1):
+    # Get this year's payments from amortization schedule
+    year_schedule = amortization[amortization['Year'] == year]
+    yearly_interest = year_schedule['Interest'].sum()
+    yearly_principal = year_schedule['Principal'].sum()
     
-    # Display immediate comparison
+    # Tax savings this year
+    tax_savings = calculate_tax_savings(
+        yearly_interest,
+        property_tax_annual,
+        annual_income,
+        filing_status
+    )
+    cumulative_tax_savings += tax_savings
+    
+    # Ownership costs this year (after tax savings)
+    yearly_ownership = (total_monthly_ownership * 12) - tax_savings
+    cumulative_own += yearly_ownership
+    ownership_costs_yearly.append(yearly_ownership)
+    
+    # Rental costs this year
+    yearly_rental = (current_rent + monthly_renters_insurance) * 12
+    cumulative_rent += yearly_rental
+    rental_costs_yearly.append(yearly_rental)
+    
+    # Home appreciation
+    current_home_value *= (1 + home_appreciation / 100)
+    
+    # Equity calculation
+    remaining_principal -= yearly_principal
+    equity = current_home_value - max(0, remaining_principal)
+    home_equity_yearly.append(equity)
+    
+    # Store data
+    years_list.append(year)
+    ownership_cumulative.append(cumulative_own)
+    rental_cumulative.append(cumulative_rent)
+    home_equity.append(equity)
+    tax_savings_cumulative.append(cumulative_tax_savings)
+    
+    # Increase rent for next year
+    current_rent *= (1 + rent_increase_annual / 100)
+
+# Calculate break-even point
+break_even_year = calculate_break_even_point(ownership_costs_yearly, rental_costs_yearly, home_equity_yearly)
+
+# ==================== TAB 1: MAIN ANALYSIS ====================
+
+with tab1:
+    # Quick Summary Metrics
     st.subheader("💰 Monthly Cost Comparison")
     
-    metric_col1, metric_col2, metric_col3 = st.columns(3)
+    col1, col2, col3 = st.columns(3)
     
-    with metric_col1:
+    with col1:
         st.metric(
             "Monthly Ownership Cost",
             f"${total_monthly_ownership:,.2f}",
-            help="Total monthly cost of owning"
+            help="Before tax benefits"
         )
     
-    with metric_col2:
+    with col2:
         st.metric(
             "Monthly Rental Cost",
-            f"${total_monthly_rental:,.2f}",
-            help="Total monthly cost of renting"
+            f"${total_monthly_rental:,.2f}"
         )
     
-    with metric_col3:
+    with col3:
         difference = total_monthly_ownership - total_monthly_rental
         st.metric(
             "Monthly Difference",
             f"${abs(difference):,.2f}",
-            delta=f"{'Buying costs more' if difference > 0 else 'Renting costs more'}",
-            help="How much more expensive per month"
+            delta="Buying costs more" if difference > 0 else "Renting costs more"
         )
     
-    # Cost breakdown
-    st.subheader("📋 Cost Breakdown")
+    # Closing Costs
+    if include_closing and closing_costs:
+        st.divider()
+        st.subheader("💵 Closing Costs Breakdown")
+        
+        close_col1, close_col2 = st.columns(2)
+        
+        with close_col1:
+            st.write(f"**Origination Fee (1%):** ${closing_costs['origination_fee']:,.2f}")
+            st.write(f"**Appraisal:** ${closing_costs['appraisal']:,.2f}")
+            st.write(f"**Title Insurance:** ${closing_costs['title_insurance']:,.2f}")
+        
+        with close_col2:
+            st.write(f"**Home Inspection:** ${closing_costs['inspection']:,.2f}")
+            st.write(f"**Recording Fees:** ${closing_costs['recording_fees']:,.2f}")
+            st.write(f"**Other Fees:** ${closing_costs['other_fees']:,.2f}")
+        
+        st.metric("**Total Closing Costs**", f"${closing_costs['total']:,.2f}")
+        st.caption("These are one-time costs paid at closing")
     
-    breakdown_col1, breakdown_col2 = st.columns(2)
-    
-    with breakdown_col1:
-        st.markdown("**Ownership Costs:**")
-        st.write(f"- Mortgage Payment: ${monthly_mortgage:,.2f}")
-        st.write(f"- Property Tax: ${monthly_property_tax:,.2f}")
-        st.write(f"- Home Insurance: ${monthly_insurance:,.2f}")
-        st.write(f"- HOA Fees: ${hoa_monthly:,.2f}")
-        st.write(f"- Maintenance: ${monthly_maintenance:,.2f}")
-        st.write(f"- **Down Payment: ${down_payment:,.2f}** (one-time)")
-    
-    with breakdown_col2:
-        st.markdown("**Rental Costs:**")
-        st.write(f"- Monthly Rent: ${monthly_rent:,.2f}")
-        st.write(f"- Renter's Insurance: ${monthly_renters_insurance:,.2f}")
-    
+    # Tax Benefits
     st.divider()
+    st.subheader("🧾 Tax Benefits")
     
-    # Multi-year analysis
+    first_year_interest = amortization[amortization['Year'] == 1]['Interest'].sum()
+    first_year_tax_savings = calculate_tax_savings(
+        first_year_interest,
+        property_tax_annual,
+        annual_income,
+        filing_status
+    )
+    
+    tax_col1, tax_col2, tax_col3 = st.columns(3)
+    
+    with tax_col1:
+        st.metric(
+            "Year 1 Interest Paid",
+            f"${first_year_interest:,.2f}"
+        )
+    
+    with tax_col2:
+        st.metric(
+            "Year 1 Tax Savings",
+            f"${first_year_tax_savings:,.2f}"
+        )
+    
+    with tax_col3:
+        st.metric(
+            f"{analysis_years}-Year Total Tax Savings",
+            f"${cumulative_tax_savings:,.2f}"
+        )
+    
+    if first_year_tax_savings == 0:
+        st.info("💡 Tax savings are $0 because your itemized deductions don't exceed the standard deduction. This is common with smaller mortgages or higher incomes.")
+    
+    # Break-even Analysis
+    st.divider()
+    st.subheader("⚖️ Break-Even Analysis")
+    
+    if break_even_year:
+        st.success(f"🎯 **Break-even point: Year {break_even_year}**")
+        st.write(f"After {break_even_year} years, the net cost of buying becomes less than renting (considering home equity).")
+    else:
+        st.warning(f"⚠️ **No break-even within {analysis_years} years**")
+        st.write("Renting remains cheaper than buying (on a net cost basis) throughout the analysis period.")
+    
+    # Multi-year visualization
+    st.divider()
     st.subheader(f"📈 {analysis_years}-Year Cost Analysis")
     
-    # Build data for each year
-    years = []
-    ownership_cumulative = []
-    rental_cumulative = []
-    home_equity = []
-    opportunity_cost_investment = []
+    # Create comprehensive chart
+    fig = make_subplots(
+        rows=2, cols=1,
+        subplot_titles=("Cumulative Costs & Equity", "Annual Costs Comparison"),
+        vertical_spacing=0.15,
+        row_heights=[0.6, 0.4]
+    )
     
-    current_home_value = home_price
-    current_rent = monthly_rent
-    cumulative_own = down_payment  # Start with down payment
-    cumulative_rent = 0
-    remaining_principal = loan_amount
-    invested_amount = down_payment  # If you had invested the down payment instead
+    # Top chart: Cumulative
+    fig.add_trace(
+        go.Scatter(
+            x=years_list,
+            y=ownership_cumulative,
+            name='Cumulative Ownership Costs',
+            line=dict(color='#FF6B6B', width=3)
+        ),
+        row=1, col=1
+    )
     
-    for year in range(1, analysis_years + 1):
-        # Ownership costs this year
-        yearly_ownership = total_monthly_ownership * 12
-        cumulative_own += yearly_ownership
-        
-        # Rental costs this year
-        yearly_rental = (current_rent + monthly_renters_insurance) * 12
-        cumulative_rent += yearly_rental
-        
-        # Home appreciation
-        current_home_value *= (1 + home_appreciation / 100)
-        
-        # Calculate equity (simplified - actual amortization is more complex)
-        # This is approximate equity buildup
-        yearly_principal_payment = monthly_mortgage * 12 - (remaining_principal * interest_rate / 100)
-        remaining_principal -= yearly_principal_payment
-        equity = current_home_value - remaining_principal
-        
-        # Investment growth if down payment was invested
-        invested_amount *= (1 + investment_return / 100)
-        invested_amount += (total_monthly_ownership - total_monthly_rental) * 12  # Invest the difference each year
-        
-        # Store data
-        years.append(year)
-        ownership_cumulative.append(cumulative_own)
-        rental_cumulative.append(cumulative_rent)
-        home_equity.append(equity)
-        opportunity_cost_investment.append(invested_amount)
-        
-        # Increase rent for next year
-        current_rent *= (1 + rent_increase_annual / 100)
+    fig.add_trace(
+        go.Scatter(
+            x=years_list,
+            y=rental_cumulative,
+            name='Cumulative Rental Costs',
+            line=dict(color='#4ECDC4', width=3)
+        ),
+        row=1, col=1
+    )
     
-    # Create comparison chart
-    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=years_list,
+            y=home_equity,
+            name='Home Equity Built',
+            line=dict(color='#95E1D3', width=2, dash='dash'),
+            fill='tozeroy'
+        ),
+        row=1, col=1
+    )
     
-    fig.add_trace(go.Scatter(
-        x=years,
-        y=ownership_cumulative,
-        name='Cumulative Ownership Costs',
-        line=dict(color='#FF6B6B', width=3)
-    ))
+    # Bottom chart: Annual costs
+    fig.add_trace(
+        go.Bar(
+            x=years_list,
+            y=ownership_costs_yearly,
+            name='Annual Ownership Cost',
+            marker_color='#FF6B6B'
+        ),
+        row=2, col=1
+    )
     
-    fig.add_trace(go.Scatter(
-        x=years,
-        y=rental_cumulative,
-        name='Cumulative Rental Costs',
-        line=dict(color='#4ECDC4', width=3)
-    ))
+    fig.add_trace(
+        go.Bar(
+            x=years_list,
+            y=rental_costs_yearly,
+            name='Annual Rental Cost',
+            marker_color='#4ECDC4'
+        ),
+        row=2, col=1
+    )
     
-    fig.add_trace(go.Scatter(
-        x=years,
-        y=home_equity,
-        name='Home Equity Built',
-        line=dict(color='#95E1D3', width=2, dash='dash')
-    ))
+    fig.update_xaxes(title_text="Year", row=2, col=1)
+    fig.update_yaxes(title_text="Amount ($)", row=1, col=1)
+    fig.update_yaxes(title_text="Amount ($)", row=2, col=1)
     
     fig.update_layout(
-        title=f"Cost Comparison Over {analysis_years} Years",
-        xaxis_title="Year",
-        yaxis_title="Amount ($)",
+        height=800,
         hovermode='x unified',
-        height=500
+        showlegend=True
     )
     
     st.plotly_chart(fig, use_container_width=True)
     
-    # Final summary
-    st.subheader("🎯 Summary")
+    # Final Summary
+    st.divider()
+    st.subheader("🎯 Final Summary")
     
-    final_col1, final_col2 = st.columns(2)
+    summary_col1, summary_col2 = st.columns(2)
     
-    with final_col1:
+    with summary_col1:
         st.metric(
             f"Total Ownership Costs ({analysis_years} years)",
             f"${ownership_cumulative[-1]:,.2f}"
@@ -342,31 +596,293 @@ if st.button("📊 Calculate Comparison", type="primary", use_container_width=Tr
             f"${net_ownership:,.2f}",
             help="Total costs minus equity built"
         )
+        st.metric(
+            "Total Tax Savings",
+            f"${cumulative_tax_savings:,.2f}"
+        )
     
-    with final_col2:
+    with summary_col2:
         st.metric(
             f"Total Rental Costs ({analysis_years} years)",
             f"${rental_cumulative[-1]:,.2f}"
         )
-        st.metric(
-            "If Down Payment Was Invested",
-            f"${opportunity_cost_investment[-1]:,.2f}",
-            help="Value if you invested the down payment instead"
-        )
         
-    # Final verdict
+        savings = rental_cumulative[-1] - net_ownership
+        
+        if savings > 0:
+            st.success(f"✅ **Buying saves ${savings:,.2f}** over {analysis_years} years")
+        else:
+            st.warning(f"⚠️ **Renting saves ${abs(savings):,.2f}** over {analysis_years} years")
+        
+        # ROI calculation
+        total_invested = down_payment + (closing_costs['total'] if include_closing and closing_costs else 0)
+        roi = ((home_equity[-1] - total_invested) / total_invested) * 100 if total_invested > 0 else 0
+        st.metric(
+            "Return on Investment (ROI)",
+            f"{roi:.1f}%",
+            help="Based on equity gained vs initial investment"
+        )
+    
+    st.info("💡 **Remember:** This analysis doesn't account for all factors like moving costs, job flexibility, investment opportunity costs, or lifestyle preferences. Consult a financial advisor for personalized advice.")
+
+# ==================== TAB 2: AMORTIZATION SCHEDULE ====================
+
+with tab2:
+    st.subheader("🔢 Complete Amortization Schedule")
+    
+    st.write(f"**Loan Amount:** ${loan_amount:,.2f}")
+    st.write(f"**Interest Rate:** {interest_rate}%")
+    st.write(f"**Loan Term:** {loan_term} years")
+    st.write(f"**Monthly Payment:** ${monthly_mortgage:,.2f}")
+    
     st.divider()
     
-    if net_ownership < rental_cumulative[-1]:
-        st.success(f"✅ **Buying is cheaper by ${rental_cumulative[-1] - net_ownership:,.2f}** over {analysis_years} years (after accounting for equity)")
-    else:
-        st.warning(f"⚠️ **Renting is cheaper by ${net_ownership - rental_cumulative[-1]:,.2f}** over {analysis_years} years")
+    # Yearly summary
+    st.subheader("📅 Yearly Summary")
     
-    st.info("💡 **Remember:** This analysis doesn't account for tax benefits, closing costs, selling costs, or lifestyle factors. Consult with a financial advisor for personalized advice.")
+    yearly_summary = amortization.groupby('Year').agg({
+        'Payment': 'sum',
+        'Principal': 'sum',
+        'Interest': 'sum',
+        'Balance': 'last'
+    }).reset_index()
+    
+    yearly_summary.columns = ['Year', 'Total Payments', 'Principal Paid', 'Interest Paid', 'Ending Balance']
+    
+    # Format as currency
+    for col in ['Total Payments', 'Principal Paid', 'Interest Paid', 'Ending Balance']:
+        yearly_summary[col] = yearly_summary[col].apply(lambda x: f"${x:,.2f}")
+    
+    st.dataframe(yearly_summary, use_container_width=True, hide_index=True)
+    
+    # Visualization
+    st.divider()
+    st.subheader("📊 Principal vs Interest Over Time")
+    
+    yearly_agg = amortization.groupby('Year').agg({
+        'Principal': 'sum',
+        'Interest': 'sum'
+    }).reset_index()
+    
+    fig_amort = go.Figure()
+    
+    fig_amort.add_trace(go.Bar(
+        x=yearly_agg['Year'],
+        y=yearly_agg['Principal'],
+        name='Principal',
+        marker_color='#95E1D3'
+    ))
+    
+    fig_amort.add_trace(go.Bar(
+        x=yearly_agg['Year'],
+        y=yearly_agg['Interest'],
+        name='Interest',
+        marker_color='#FF6B6B'
+    ))
+    
+    fig_amort.update_layout(
+        barmode='stack',
+        title="Annual Payment Breakdown",
+        xaxis_title="Year",
+        yaxis_title="Amount ($)",
+        hovermode='x unified',
+        height=500
+    )
+    
+    st.plotly_chart(fig_amort, use_container_width=True)
+    
+    # Detailed monthly schedule
+    st.divider()
+    st.subheader("📋 Detailed Monthly Schedule")
+    
+    selected_year = st.selectbox(
+        "View detailed schedule for year:",
+        options=list(range(1, loan_term + 1))
+    )
+    
+    year_detail = amortization[amortization['Year'] == selected_year].copy()
+    
+    # Format columns
+    for col in ['Payment', 'Principal', 'Interest', 'Balance']:
+        year_detail[col] = year_detail[col].apply(lambda x: f"${x:,.2f}")
+    
+    st.dataframe(year_detail[['Month', 'Payment', 'Principal', 'Interest', 'Balance']], use_container_width=True, hide_index=True)
 
-else:
-    st.info("👆 Fill in your details above and click 'Calculate Comparison' to see the results!")
+# ==================== TAB 3: COMPARE SCENARIOS ====================
+
+with tab3:
+    st.subheader("⚖️ Compare Multiple Scenarios")
+    
+    if 'scenarios' not in st.session_state or len(st.session_state.scenarios) == 0:
+        st.info("👈 Save scenarios from the sidebar to compare them here!")
+        st.write("**How to use:**")
+        st.write("1. Configure your first scenario in the sidebar")
+        st.write("2. Click 'Save This Scenario'")
+        st.write("3. Change the inputs for a different scenario")
+        st.write("4. Save that scenario too")
+        st.write("5. Compare them all here!")
+    else:
+        st.success(f"✅ You have {len(st.session_state.scenarios)} saved scenario(s)")
+        
+        # Show all scenarios in a comparison table
+        comparison_data = []
+        
+        for scenario in st.session_state.scenarios:
+            # Quick recalculation for each scenario
+            s_down_payment = scenario['home_price'] * (scenario['down_payment_pct'] / 100)
+            s_loan_amount = scenario['home_price'] - s_down_payment
+            s_monthly_payment = calculate_monthly_mortgage(
+                s_loan_amount,
+                scenario['interest_rate'],
+                scenario['loan_term']
+            )
+            
+            comparison_data.append({
+                'Scenario': scenario['name'],
+                'Home Price': f"${scenario['home_price']:,.0f}",
+                'Down Payment': f"${s_down_payment:,.0f}",
+                'Interest Rate': f"{scenario['interest_rate']}%",
+                'Loan Term': f"{scenario['loan_term']} years",
+                'Monthly Payment': f"${s_monthly_payment:,.2f}",
+                'Monthly Rent': f"${scenario['monthly_rent']:,.2f}"
+            })
+        
+        comparison_df = pd.DataFrame(comparison_data)
+        st.dataframe(comparison_df, use_container_width=True, hide_index=True)
+        
+        # Clear scenarios button
+        if st.button("🗑️ Clear All Saved Scenarios"):
+            st.session_state.scenarios = []
+            st.rerun()
+
+# ==================== TAB 4: EXPORT RESULTS ====================
+
+with tab4:
+    st.subheader("💾 Export Your Results")
+    
+    st.write("Download your complete analysis in various formats:")
+    
+    # Prepare data for export
+    export_summary = {
+        'Parameter': [
+            'Home Price',
+            'Down Payment',
+            'Loan Amount',
+            'Interest Rate',
+            'Loan Term',
+            'Monthly Mortgage Payment',
+            'Monthly Rent',
+            'Analysis Period',
+            f'Total Ownership Costs ({analysis_years} years)',
+            f'Total Rental Costs ({analysis_years} years)',
+            f'Home Equity Built ({analysis_years} years)',
+            'Net Cost of Ownership',
+            f'Total Tax Savings ({analysis_years} years)',
+            'Break-Even Year'
+        ],
+        'Value': [
+            f"${home_price:,.2f}",
+            f"${down_payment:,.2f}",
+            f"${loan_amount:,.2f}",
+            f"{interest_rate}%",
+            f"{loan_term} years",
+            f"${monthly_mortgage:,.2f}",
+            f"${monthly_rent:,.2f}",
+            f"{analysis_years} years",
+            f"${ownership_cumulative[-1]:,.2f}",
+            f"${rental_cumulative[-1]:,.2f}",
+            f"${home_equity[-1]:,.2f}",
+            f"${ownership_cumulative[-1] - home_equity[-1]:,.2f}",
+            f"${cumulative_tax_savings:,.2f}",
+            f"Year {break_even_year}" if break_even_year else "No break-even"
+        ]
+    }
+    
+    summary_df = pd.DataFrame(export_summary)
+    
+    # Year-by-year data
+    yearly_data = pd.DataFrame({
+        'Year': years_list,
+        'Cumulative Ownership Costs': ownership_cumulative,
+        'Cumulative Rental Costs': rental_cumulative,
+        'Home Equity': home_equity,
+        'Cumulative Tax Savings': tax_savings_cumulative,
+        'Annual Ownership Cost': ownership_costs_yearly,
+        'Annual Rental Cost': rental_costs_yearly
+    })
+    
+    # Format currency columns
+    for col in yearly_data.columns[1:]:
+        yearly_data[col] = yearly_data[col].apply(lambda x: f"${x:,.2f}")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        # Excel export
+        st.subheader("📊 Excel Spreadsheet")
+        
+        # Create Excel file in memory
+        excel_buffer = io.BytesIO()
+        with pd.ExcelWriter(excel_buffer, engine='xlsxwriter') as writer:
+            summary_df.to_excel(writer, sheet_name='Summary', index=False)
+            yearly_data.to_excel(writer, sheet_name='Yearly Analysis', index=False)
+            amortization.to_excel(writer, sheet_name='Amortization Schedule', index=False)
+            
+            # Format the sheets
+            workbook = writer.book
+            currency_format = workbook.add_format({'num_format': '$#,##0.00'})
+            
+        excel_buffer.seek(0)
+        
+        st.download_button(
+            label="📥 Download Excel",
+            data=excel_buffer,
+            file_name=f"home_loan_analysis_{datetime.now().strftime('%Y%m%d')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
+        
+        st.caption("Includes: Summary, Yearly Analysis, and Amortization Schedule")
+    
+    with col2:
+        # CSV export
+        st.subheader("📄 CSV Files")
+        
+        # Combine all data into one CSV
+        csv_buffer = io.StringIO()
+        csv_buffer.write("=== SUMMARY ===\n")
+        summary_df.to_csv(csv_buffer, index=False)
+        csv_buffer.write("\n=== YEARLY ANALYSIS ===\n")
+        yearly_data.to_csv(csv_buffer, index=False)
+        csv_buffer.write("\n=== AMORTIZATION SCHEDULE ===\n")
+        amortization.to_csv(csv_buffer, index=False)
+        
+        st.download_button(
+            label="📥 Download CSV",
+            data=csv_buffer.getvalue(),
+            file_name=f"home_loan_analysis_{datetime.now().strftime('%Y%m%d')}.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
+        
+        st.caption("All data combined in one CSV file")
+    
+    # Preview the data
+    st.divider()
+    st.subheader("📋 Data Preview")
+    
+    preview_tab1, preview_tab2, preview_tab3 = st.tabs(["Summary", "Yearly Analysis", "Amortization"])
+    
+    with preview_tab1:
+        st.dataframe(summary_df, use_container_width=True, hide_index=True)
+    
+    with preview_tab2:
+        st.dataframe(yearly_data, use_container_width=True, hide_index=True)
+    
+    with preview_tab3:
+        st.dataframe(amortization.head(50), use_container_width=True, hide_index=True)
+        st.caption("Showing first 50 months. Download full schedule for complete data.")
 
 # Footer
 st.divider()
-st.caption("Built with Streamlit | For educational purposes only")
+st.caption(f"Built with Streamlit | Last updated: {datetime.now().strftime('%B %d, %Y')} | For educational purposes only")
