@@ -389,6 +389,7 @@ st.title("🏠 Professional Home Loan Calculator")
 st.markdown("""
 Comprehensive financial analysis tool with ARM mortgages, PMI, refinancing, 
 Monte Carlo simulations, and inflation adjustments.
+By Wilfred Hawkins
 """)
 
 # Create tabs
